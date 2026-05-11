@@ -8,6 +8,7 @@ use ethers::providers::{Http, Provider};
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::{Address, H256, U256};
 use ethers::utils::format_units;
+use ethers::middleware::Middleware;
 
 use ocl::{Buffer, Device, Platform, ProQue};
 use rand::random;
@@ -220,6 +221,16 @@ struct ClaimEngine {
     cached_gas_limit: std::sync::Mutex<(U256, Instant)>,
     /// How often to refresh gas estimate (default: 5 min)
     gas_cache_ttl: Duration,
+    /// Raw HTTP client for fastest possible broadcast (HTTP/2, connection pooling)
+    http_client: reqwest::Client,
+    /// Raw RPC URLs for direct JSON-RPC broadcast
+    rpc_urls: Vec<String>,
+    /// Wallet for raw signing
+    wallet: LocalWallet,
+    /// Chain ID
+    chain_id: u64,
+    /// Contract address
+    contract_addr: Address,
 }
 
 impl ClaimEngine {
@@ -330,6 +341,79 @@ impl ClaimEngine {
 
         (mev_ok, mev_fail)
     }
+
+    /// Ultra-fast claim: sign TX, broadcast raw JSON-RPC via reqwest (no ethers overhead).
+    async fn fast_claim(&self, nonce: u64) -> (usize, usize) {
+        let gas_limit = self.gas_limit_for(nonce).await;
+
+        // Build calldata: selector(4) + nonce(32)
+        let selector: [u8; 4] = [0xfe, 0x0c, 0x46, 0xaf];
+        let mut call_data = Vec::with_capacity(36);
+        call_data.extend_from_slice(&selector);
+        let mut nonce_buf = [0u8; 32];
+        U256::from(nonce).to_big_endian(&mut nonce_buf);
+        call_data.extend_from_slice(&nonce_buf);
+
+        // Build raw calldata JSON-RPC call (bypass ethers TX signing entirely)
+        let calldata_hex = format!("0x{}", hex::encode(&call_data));
+        let from_hex = format!("0x{:x}", self.wallet.address());
+        let to_hex = format!("0x{:x}", self.contract_addr);
+        let gas_price_hex = format!("0x{:x}", self.gas_price);
+        let gas_limit_hex = format!("0x{:x}", gas_limit);
+
+        // Use eth_sendTransaction (node will sign via unlocked account)
+        // Or use raw JSON-RPC with pre-built calldata
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_sendTransaction",
+            "params": [{
+                "from": from_hex,
+                "to": to_hex,
+                "data": calldata_hex,
+                "gasPrice": gas_price_hex,
+                "gas": gas_limit_hex,
+                "value": "0x0"
+            }],
+            "id": 1
+        });
+
+
+        // Fire to ALL providers simultaneously via reqwest (HTTP/2, connection pooling)
+        let futs: Vec<_> = self.rpc_urls.iter().map(|url| {
+            let client = self.http_client.clone();
+            let payload = payload.clone();
+            let url = url.clone();
+            async move {
+                match client.post(&url).json(&payload).send().await {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                            if let Some(hash) = body.get("result") {
+                                log_line(&format!("  ✅ [{}] sent | tx={}", &url[..url.len().min(40)], hash));
+                                return Ok(url);
+                            }
+                            if let Some(err) = body.get("error") {
+                                log_line(&format!("  ⚠️ [{}] rpc: {}", &url[..url.len().min(40)], err));
+                                return Err(url);
+                            }
+                        }
+                        log_line(&format!("  ⚠️ [{}] http {}", &url[..url.len().min(40)], status));
+                        Err(url)
+                    }
+                    Err(e) => {
+                        log_line(&format!("  ❌ [{}] net: {}", &url[..url.len().min(40)], e));
+                        Err(url)
+                    }
+                }
+            }
+        }).collect();
+
+        let results = futures::future::join_all(futs).await;
+        let ok = results.iter().filter(|r| r.is_ok()).count();
+        let fail = results.len() - ok;
+        (ok, fail)
+    }
 }
 
 fn log_line(msg: &str) {
@@ -418,14 +502,44 @@ async fn main() -> Result<()> {
     let mev_count = priority_contracts.len();
     let rpc_count = regular_contracts.len();
 
+    // Collect raw RPC URLs for fast_claim
+    let mut rpc_urls: Vec<String> = Vec::new();
+    for key in &["RPC_MEV_1", "RPC_MEV_2", "RPC_URL", "RPC_URL_2", "RPC_URL_3", "RPC_URL_4", "RPC_URL_5", "RPC_URL_6", "RPC_URL_7", "RPC_URL_8", "RPC_URL_9", "RPC_URL_10"] {
+        if let Ok(url) = env::var(key) {
+            if !url.trim().is_empty() {
+                rpc_urls.push(url);
+            }
+        }
+    }
+
+    let http_client = reqwest::Client::builder()
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .pool_max_idle_per_host(4)
+        .tcp_keepalive(Duration::from_secs(60))
+        .build()
+        .expect("reqwest client build failed");
+
     let default_gas = U256::from(gas_limit_u64);
+
+    // Get chain_id from first regular contract before moving
+    let chain_id = if !regular_contracts.is_empty() {
+        regular_contracts[0].1.client().provider().get_chainid().await.unwrap_or(U256::from(1)).as_u64()
+    } else {
+        priority_contracts[0].1.client().provider().get_chainid().await.unwrap_or(U256::from(1)).as_u64()
+    };
+
     let engine = Arc::new(ClaimEngine {
         priority_contracts,
         contracts: regular_contracts,
         gas_price: U256::from(gas_gwei.saturating_mul(1_000_000_000u64)),
         gas_limit: default_gas,
-        cached_gas_limit: std::sync::Mutex::new((default_gas, Instant::now() - Duration::from_secs(gas_cache_secs + 1))), // force refresh on first claim
+        cached_gas_limit: std::sync::Mutex::new((default_gas, Instant::now() - Duration::from_secs(gas_cache_secs + 1))),
         gas_cache_ttl: Duration::from_secs(gas_cache_secs),
+        http_client,
+        rpc_urls,
+        wallet: wallet.clone(),
+        chain_id,
+        contract_addr: address,
     });
 
     log_line(&format!("Wallet: 0x{:x}", wallet.address()));
@@ -544,6 +658,11 @@ async fn run_test_mode() -> Result<()> {
         gas_limit: U256::from(200_000u64),
         cached_gas_limit: std::sync::Mutex::new((U256::from(200_000u64), Instant::now())),
         gas_cache_ttl: Duration::from_secs(300),
+        http_client: reqwest::Client::new(),
+        rpc_urls: Vec::new(),
+        wallet: LocalWallet::new(&mut rand::thread_rng()),
+        chain_id: 1,
+        contract_addr: Address::zero(),
     });
     let nonce = mine_gpu_multi(&gpus, &work, test_engine).await;
 
@@ -700,7 +819,7 @@ fn mine_one_gpu(
                 // === FCFS: Claim DIRECTLY from GPU thread (zero hop) ===
                 let t_claim = Instant::now();
                 let runtime = tokio::runtime::Handle::current();
-                let (ok, fail) = runtime.block_on(engine.claim(nonce));
+                let (ok, fail) = runtime.block_on(engine.fast_claim(nonce));
                 let claim_time = t_claim.elapsed();
                 log_line(&format!(
                     "🏆 CLAIM DONE | nonce={} | {}/{} OK | claim={:?} | {}",
