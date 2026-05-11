@@ -6,10 +6,10 @@ use ethers::contract::Contract;
 use ethers::middleware::SignerMiddleware;
 use ethers::providers::{Http, Provider};
 use ethers::signers::{LocalWallet, Signer};
-use ethers::types::{Address, H256, U256, transaction::eip2718::TypedTransaction};
+use ethers::types::{Address, H256, U256};
 use ethers::utils::format_units;
-use ethers::middleware::Middleware;
-use ocl::{Buffer, ProQue};
+
+use ocl::{Buffer, Device, Platform, ProQue};
 use rand::random;
 use sha3::{Digest, Keccak256};
 use std::env;
@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
+
 
 const CONTRACT_ADDRESS: &str = "0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc";
 
@@ -200,19 +201,102 @@ __kernel void hash256_mine(
 }
 "#;
 
+#[derive(Clone)]
 struct Work {
     challenge: [u8; 32],
     difficulty_bytes: [u8; 32],
     difficulty: U256,
 }
 
-/// Pre-encoded call data for mine(uint256) — avoids re-encoding every time
-struct PreparedCall {
-    selector: [u8; 4],       // 0xfe0c46af
-    chain_id: u64,
-    contract_addr: Address,
-    gas_price: U256,         // 1 Gwei
-    gas_limit: U256,         // 150,000
+/// Claim engine: sends mine() TX to ALL providers in parallel.
+struct ClaimEngine {
+    /// MEV/Flashbots endpoints — fired FIRST (priority, faster block inclusion)
+    priority_contracts: Vec<(String, Contract<SignerMiddleware<Provider<Http>, LocalWallet>>)>,
+    /// Regular RPC endpoints
+    contracts: Vec<(String, Contract<SignerMiddleware<Provider<Http>, LocalWallet>>)>,
+    gas_price: U256,
+    gas_limit: U256,
+    /// Cached gas estimate + when it was last refreshed
+    cached_gas_limit: std::sync::Mutex<(U256, Instant)>,
+    /// How often to refresh gas estimate (default: 5 min)
+    gas_cache_ttl: Duration,
+}
+
+impl ClaimEngine {
+    /// Get gas limit — returns cached estimate if fresh, otherwise re-estimates.
+    async fn gas_limit_for(&self, nonce: u64) -> U256 {
+        // Check cache first
+        {
+            let cache = self.cached_gas_limit.lock().unwrap();
+            if cache.1.elapsed() < self.gas_cache_ttl {
+                return cache.0;
+            }
+        }
+        // Cache stale — re-estimate
+        if let Some(estimated) = self.estimate_gas_now(nonce).await {
+            let mut cache = self.cached_gas_limit.lock().unwrap();
+            *cache = (estimated, Instant::now());
+            estimated
+        } else {
+            self.gas_limit // fallback
+        }
+    }
+
+    /// Actually call eth_estimateGas (slow — RPC roundtrip).
+    async fn estimate_gas_now(&self, nonce: u64) -> Option<U256> {
+        let c = &self.contracts.first()?.1;
+        let call = c.method::<U256, ()>("mine", U256::from(nonce)).ok()?;
+        let estimated = call.estimate_gas().await.ok()?;
+        Some(estimated * U256::from(120) / U256::from(100)) // +20% buffer
+    }
+
+    /// Fire mine(nonce) to ALL providers (MEV first, then regular) in parallel.
+    async fn claim(&self, nonce: u64) -> (usize, usize) {
+        let nonce_u256 = U256::from(nonce);
+
+        // Estimate dynamic gas limit (cached — fast after first call)
+        let gas_limit = self.gas_limit_for(nonce).await;
+
+        // Build all futures: MEV/Flashbots FIRST, then regular
+        let mut all: Vec<(&str, &Contract<SignerMiddleware<Provider<Http>, LocalWallet>>)> = Vec::new();
+        for (label, c) in &self.priority_contracts {
+            all.push((label, c));
+        }
+        for (label, c) in &self.contracts {
+            all.push((label, c));
+        }
+
+        let futs: Vec<_> = all.into_iter().map(|(label, c)| {
+            let c = c.clone();
+            let label = label.to_string();
+            let gp = self.gas_price;
+            let gl = gas_limit;
+            async move {
+                match c.method::<U256, ()>("mine", nonce_u256) {
+                    Ok(call) => match call.gas_price(gp).gas(gl).send().await {
+                        Ok(pending) => {
+                            let hash = pending.tx_hash();
+                            log_line(&format!("  ✅ [{}] sent | tx=0x{:x}", label, hash));
+                            Ok(label)
+                        }
+                        Err(e) => {
+                            log_line(&format!("  ⚠️ [{}] failed: {}", label, e));
+                            Err(label)
+                        }
+                    },
+                    Err(e) => {
+                        log_line(&format!("  ❌ [{}] build: {}", label, e));
+                        Err(label)
+                    }
+                }
+            }
+        }).collect();
+
+        let results = futures::future::join_all(futs).await;
+        let ok = results.iter().filter(|r| r.is_ok()).count();
+        let fail = results.len() - ok;
+        (ok, fail)
+    }
 }
 
 fn log_line(msg: &str) {
@@ -234,46 +318,97 @@ async fn main() -> Result<()> {
         return run_test_mode().await;
     }
 
-    let rpc_url = env::var("RPC_URL").context("Isi RPC_URL di .env")?;
     let private_key = env::var("PRIVATE_KEY").context("Isi PRIVATE_KEY di .env")?;
     if !private_key.starts_with("0x") {
         anyhow::bail!("PRIVATE_KEY harus diawali 0x");
     }
 
-    let provider = Provider::<Http>::try_from(rpc_url)?;
     let wallet: LocalWallet = private_key.parse()?;
-    let client = Arc::new(SignerMiddleware::new(provider, wallet.clone()));
     let address: Address = CONTRACT_ADDRESS.parse()?;
     let abi: Abi = serde_json::from_str(ABI_JSON)?;
-    let contract = Contract::new(address, abi, client.clone());
 
-    log_line(&format!("Wallet: 0x{:x}", wallet.address()));
-    log_line(&format!("Contract: {}", CONTRACT_ADDRESS));
-    log_line("⚡ FCFS mode: skip CPU verify, pre-signed TX, 1 Gwei gas");
+    // Build Contract instances for ALL RPC providers (MEV/Flashbots FIRST, then regular)
+    let mut priority_contracts: Vec<(String, Contract<SignerMiddleware<Provider<Http>, LocalWallet>>)> = Vec::new();
+    let mut regular_contracts: Vec<(String, Contract<SignerMiddleware<Provider<Http>, LocalWallet>>)> = Vec::new();
 
-    let gpu = setup_opencl();
-    match &gpu {
-        Ok(_) => log_line("GPU OpenCL tersedia."),
-        Err(e) => {
-            log_line(&format!("GPU tidak tersedia: {}", e));
-            anyhow::bail!("GPU OpenCL diperlukan. Fallback CPU dinonaktifkan.");
+    // MEV/Flashbots endpoints (priority — fire first for faster block inclusion)
+    for key in &["RPC_MEV_1", "RPC_MEV_2", "RPC_MEV_3", "RPC_MEV_4"] {
+        if let Ok(url) = env::var(key) {
+            if !url.trim().is_empty() {
+                match Provider::<Http>::try_from(url.clone()) {
+                    Ok(p) => {
+                        let client = Arc::new(SignerMiddleware::new(p, wallet.clone()));
+                        let contract = Contract::new(address, abi.clone(), client);
+                        log_line(&format!("  🔒 MEV RPC: {} ({})", key, &url[..url.len().min(50)]));
+                        priority_contracts.push((key.to_string(), contract));
+                    }
+                    Err(e) => log_line(&format!("  ⚠️ MEV skip ({}): {}", key, e)),
+                }
+            }
         }
     }
 
-    // Pre-prepare call data template (mine selector = 0xfe0c46af)
-    let chain_id = client.provider().get_chainid().await.unwrap_or(U256::from(1)).as_u64();
-    let prepared = PreparedCall {
-        selector: [0xfe, 0x0c, 0x46, 0xaf],
-        chain_id,
-        contract_addr: address,
-        gas_price: U256::from(1_000_000_000u64), // 1 Gwei — fast inclusion
-        gas_limit: U256::from(150_000u64),
+    // Regular RPC endpoints
+    for key in &["RPC_URL", "RPC_URL_2", "RPC_URL_3", "RPC_URL_4", "RPC_URL_5", "RPC_URL_6", "RPC_URL_7", "RPC_URL_8", "RPC_URL_9", "RPC_URL_10"] {
+        if let Ok(url) = env::var(key) {
+            if !url.trim().is_empty() {
+                match Provider::<Http>::try_from(url.clone()) {
+                    Ok(p) => {
+                        let client = Arc::new(SignerMiddleware::new(p, wallet.clone()));
+                        let contract = Contract::new(address, abi.clone(), client);
+                        let label = key.to_string();
+                        log_line(&format!("  🌐 RPC: {} ({})", key, &url[..url.len().min(50)]));
+                        regular_contracts.push((label, contract));
+                    }
+                    Err(e) => log_line(&format!("  ⚠️ RPC skip ({}): {}", key, e)),
+                }
+            }
+        }
+    }
+
+    let total_rpcs = priority_contracts.len() + regular_contracts.len();
+    if total_rpcs == 0 {
+        anyhow::bail!("Minimal 1 RPC_URL diperlukan di .env");
+    }
+
+    // Primary contract for reads (miningState, getChallenge) — use first regular
+    let read_contract = if !regular_contracts.is_empty() {
+        regular_contracts[0].1.clone()
+    } else {
+        priority_contracts[0].1.clone()
     };
 
+    let gas_gwei: u64 = env::var("GAS_GWEI").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let gas_limit_u64: u64 = env::var("GAS_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(200_000);
+    let gas_cache_secs: u64 = env::var("GAS_CACHE_TTL").ok().and_then(|v| v.parse().ok()).unwrap_or(300); // 5 min default
+
+    let mev_count = priority_contracts.len();
+    let rpc_count = regular_contracts.len();
+
+    let default_gas = U256::from(gas_limit_u64);
+    let engine = Arc::new(ClaimEngine {
+        priority_contracts,
+        contracts: regular_contracts,
+        gas_price: U256::from(gas_gwei.saturating_mul(1_000_000_000u64)),
+        gas_limit: default_gas,
+        cached_gas_limit: std::sync::Mutex::new((default_gas, Instant::now() - Duration::from_secs(gas_cache_secs + 1))), // force refresh on first claim
+        gas_cache_ttl: Duration::from_secs(gas_cache_secs),
+    });
+
+    log_line(&format!("Wallet: 0x{:x}", wallet.address()));
+    log_line(&format!("Contract: {}", CONTRACT_ADDRESS));
+    log_line(&format!("⚡ FCFS: {} MEV + {} RPC | {} Gwei | dynamic gas",
+        mev_count, rpc_count, gas_gwei));
+
+    let gpus = setup_opencl_all()?;
+    if gpus.is_empty() {
+        anyhow::bail!("GPU OpenCL diperlukan. Tidak ada device yang tersedia.");
+    }
+    log_line(&format!("GPU OpenCL tersedia: {} device", gpus.len()));
     let stop_flag = Arc::new(AtomicBool::new(false));
 
     loop {
-        let mining_state = match contract
+        let mining_state = match read_contract
             .method::<(), (U256, U256, U256, U256, U256, U256, U256)>("miningState", ())?
             .call()
             .await {
@@ -286,7 +421,7 @@ async fn main() -> Result<()> {
         };
 
         let difficulty = mining_state.2;
-        let challenge_h256: H256 = match contract
+        let challenge_h256: H256 = match read_contract
             .method::<Address, H256>("getChallenge", wallet.address())?
             .call()
             .await {
@@ -315,47 +450,11 @@ async fn main() -> Result<()> {
             difficulty,
         };
 
-        let start_time = Instant::now();
-
-        let result = mine_gpu(gpu.as_ref().unwrap(), &work, stop_flag.clone()).await;
+        let result = mine_gpu_multi(&gpus, &work, engine.clone()).await;
 
         match result {
-            Some(nonce) => {
-                let elapsed = start_time.elapsed();
-
-                // === FCFS: Sign + broadcast as fast as possible ===
-                let t_sign_start = Instant::now();
-
-                // Build call data: selector(4) + nonce(32)
-                let mut call_data = Vec::with_capacity(36);
-                call_data.extend_from_slice(&prepared.selector);
-                let mut nonce_buf = [0u8; 32];
-                U256::from(nonce).to_big_endian(&mut nonce_buf);
-                call_data.extend_from_slice(&nonce_buf);
-
-                // Use contract method with pre-set gas price — clone to avoid borrow issues
-                let t_signed = t_sign_start.elapsed();
-
-                let call = match contract.clone().method::<U256, ()>("mine", U256::from(nonce)) {
-                    Ok(c) => c.gas_price(prepared.gas_price).gas(prepared.gas_limit),
-                    Err(e) => {
-                        log_line(&format!("❌ CLAIM FAILED | nonce={} | error={}", nonce, e));
-                        continue;
-                    }
-                };
-
-                // Send TX — just broadcast, don't await receipt (FCFS speed)
-                let tx_result = call.send().await;
-                match tx_result {
-                    Ok(pending) => {
-                        let tx_hash = pending.tx_hash();
-                        let eth_link = format!("https://etherscan.io/tx/0x{:x}", tx_hash);
-                        log_line(&format!("✅ CLAIM OK | nonce={} | tx=0x{:x} | link={} | elapsed={:?}", nonce, tx_hash, eth_link, elapsed));
-                    }
-                    Err(e) => {
-                        log_line(&format!("❌ CLAIM FAILED | nonce={} | error={}", nonce, e));
-                    }
-                }
+            Some(_nonce) => {
+                // Claim is now done directly inside mine_gpu_multi — log handled there
             }
             None => {
                 log_line("Challenge berubah atau stopped, restart mining...");
@@ -398,18 +497,22 @@ async fn run_test_mode() -> Result<()> {
         difficulty,
     };
 
-    let stop_flag = Arc::new(AtomicBool::new(false));
     let start = Instant::now();
 
-    let nonce = match setup_opencl() {
-        Ok(ref gpu) => {
-            log_line("GPU available, running mine_gpu...");
-            mine_gpu(gpu, &work, stop_flag.clone()).await
-        }
-        Err(e) => {
-            anyhow::bail!("GPU OpenCL required but unavailable: {}", e);
-        }
-    };
+    let gpus = setup_opencl_all().unwrap_or_default();
+    if gpus.is_empty() {
+        anyhow::bail!("GPU OpenCL required but unavailable");
+    }
+    log_line(&format!("TEST: {} GPU(s) detected", gpus.len()));
+    let test_engine = Arc::new(ClaimEngine {
+        priority_contracts: Vec::new(),
+        contracts: Vec::new(),
+        gas_price: U256::from(5u64.saturating_mul(1_000_000_000u64)),
+        gas_limit: U256::from(200_000u64),
+        cached_gas_limit: std::sync::Mutex::new((U256::from(200_000u64), Instant::now())),
+        gas_cache_ttl: Duration::from_secs(300),
+    });
+    let nonce = mine_gpu_multi(&gpus, &work, test_engine).await;
 
     let elapsed = start.elapsed();
     match nonce {
@@ -435,18 +538,40 @@ async fn run_test_mode() -> Result<()> {
     Ok(())
 }
 
-fn setup_opencl() -> Result<ProQue> {
-    Ok(ProQue::builder().src(KERNEL_SRC).build()?)
+/// Enumerate all OpenCL GPU devices and return a ProQue per device.
+fn setup_opencl_all() -> Result<Vec<ProQue>> {
+    let mut gpus = Vec::new();
+    for platform in Platform::list() {
+        for device in Device::list_all(platform)? {
+            let name = device.name().unwrap_or_else(|_| "unknown".into());
+            let proque = ProQue::builder()
+                .src(KERNEL_SRC)
+                .device(device)
+                .build()?;
+            log_line(&format!("  OpenCL device: {} (platform {:?})", name, platform));
+            gpus.push(proque);
+        }
+    }
+    Ok(gpus)
 }
 
-async fn mine_gpu(proque: &ProQue, work: &Work, stop_flag: Arc<AtomicBool>) -> Option<u64> {
+/// Single-GPU mining loop — runs on one device until nonce found or stop_flag set.
+fn mine_one_gpu(
+    gpu_id: usize,
+    proque: ProQue,
+    work: &Work,
+    stop_flag: Arc<AtomicBool>,
+    engine: Arc<ClaimEngine>,
+) -> tokio::sync::oneshot::Receiver<Option<u64>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
     let challenge_buf: Buffer<u8> = Buffer::builder()
         .queue(proque.queue().clone())
         .flags(ocl::flags::MEM_READ_ONLY)
         .len(32)
         .copy_host_slice(&work.challenge)
         .build()
-        .ok()?;
+        .expect("GPU buffer alloc failed");
 
     let diff_buf: Buffer<u8> = Buffer::builder()
         .queue(proque.queue().clone())
@@ -454,7 +579,7 @@ async fn mine_gpu(proque: &ProQue, work: &Work, stop_flag: Arc<AtomicBool>) -> O
         .len(32)
         .copy_host_slice(&work.difficulty_bytes)
         .build()
-        .ok()?;
+        .expect("GPU buffer alloc failed");
 
     let result_buf: Buffer<u64> = Buffer::builder()
         .queue(proque.queue().clone())
@@ -462,7 +587,7 @@ async fn mine_gpu(proque: &ProQue, work: &Work, stop_flag: Arc<AtomicBool>) -> O
         .len(1)
         .fill_val(0u64)
         .build()
-        .ok()?;
+        .expect("GPU buffer alloc failed");
 
     let found_buf: Buffer<i32> = Buffer::builder()
         .queue(proque.queue().clone())
@@ -470,78 +595,124 @@ async fn mine_gpu(proque: &ProQue, work: &Work, stop_flag: Arc<AtomicBool>) -> O
         .len(1)
         .fill_val(0i32)
         .build()
-        .ok()?;
+        .expect("GPU buffer alloc failed");
 
     let mut base_nonce: u64 = random();
-    let work_size: usize = 1 << 20; // 1.048.576 work items
-    let batch_size: u32 = 1024;     // 1.024 nonces per work-item
+    let work_size: usize = 1 << 20; // 1M work items
+    let batch_size: u32 = 1024;     // 1024 nonces per work-item
     let hashes_per_launch = (work_size as u64) * (batch_size as u64);
 
     let total_hashes = Arc::new(AtomicU64::new(0));
-    let total_hashes_clone = total_hashes.clone();
-    let stop_flag_clone = stop_flag.clone();
+    let th_clone = total_hashes.clone();
+    let sf = stop_flag.clone();
+    let gpu_id_clone = gpu_id;
 
-    // Spawn hashrate logger task
+    // Hashrate logger per GPU
     let hashrate_handle = tokio::spawn(async move {
         let mut last_hashes = 0u64;
         let mut last_time = Instant::now();
         let log_interval = Duration::from_secs(10);
-
         loop {
             sleep(log_interval).await;
-            if stop_flag_clone.load(Ordering::Relaxed) {
-                break;
-            }
-            let current_hashes = total_hashes_clone.load(Ordering::Relaxed);
+            if sf.load(Ordering::Relaxed) { break; }
+            let cur = th_clone.load(Ordering::Relaxed);
             let elapsed = last_time.elapsed().as_secs_f64();
             if elapsed > 0.0 {
-                let hashes_delta = current_hashes.saturating_sub(last_hashes);
-                let mhps = (hashes_delta as f64) / elapsed / 1_000_000.0;
+                let delta = cur.saturating_sub(last_hashes);
+                let mhps = (delta as f64) / elapsed / 1_000_000.0;
                 log_line(&format!(
-                    "[HASHRATE] {:.2} MH/s | Total hashes: {} | Elapsed: {:.1}s",
-                    mhps,
-                    current_hashes,
-                    last_time.elapsed().as_secs_f64()
+                    "[GPU{}] {:.2} MH/s | total: {}",
+                    gpu_id_clone, mhps, cur,
                 ));
-                last_hashes = current_hashes;
+                last_hashes = cur;
                 last_time = Instant::now();
             }
         }
     });
 
-    loop {
-        if stop_flag.load(Ordering::Relaxed) {
-            let _ = hashrate_handle.await;
-            return None;
+    // Spawn blocking OpenCL loop on a dedicated thread (ocl is blocking)
+    std::thread::spawn(move || {
+        loop {
+            if stop_flag.load(Ordering::Relaxed) {
+                hashrate_handle.abort();
+                let _ = tx.send(None);
+                return;
+            }
+
+            let kernel = proque
+                .kernel_builder("hash256_mine")
+                .arg(&challenge_buf)
+                .arg(&diff_buf)
+                .arg(base_nonce)
+                .arg(batch_size)
+                .arg(&result_buf)
+                .arg(&found_buf)
+                .global_work_size(work_size)
+                .build()
+                .expect("kernel build failed");
+
+            unsafe { kernel.enq().expect("kernel enqueue failed"); }
+
+            total_hashes.fetch_add(hashes_per_launch, Ordering::Relaxed);
+
+            let mut found = vec![0i32; 1];
+            found_buf.read(&mut found).enq().expect("read found_buf failed");
+            if found[0] != 0 {
+                let mut result = vec![0u64; 1];
+                result_buf.read(&mut result).enq().expect("read result_buf failed");
+                let nonce = result[0];
+                stop_flag.store(true, Ordering::SeqCst);
+                hashrate_handle.abort();
+
+                // === FCFS: Claim DIRECTLY from GPU thread (zero hop) ===
+                let t_claim = Instant::now();
+                let runtime = tokio::runtime::Handle::current();
+                let (ok, fail) = runtime.block_on(engine.claim(nonce));
+                let claim_time = t_claim.elapsed();
+                log_line(&format!(
+                    "🏆 CLAIM DONE | nonce={} | {}/{} OK | claim={:?} | {}",
+                    nonce, ok, ok + fail, claim_time,
+                    if fail == 0 { "all sent ✅".to_string() } else { format!("{} errors ⚠️", fail) }
+                ));
+
+                let _ = tx.send(Some(nonce));
+                return;
+            }
+
+            base_nonce = base_nonce.wrapping_add(hashes_per_launch);
         }
+    });
 
-        let kernel = proque
-            .kernel_builder("hash256_mine")
-            .arg(&challenge_buf)
-            .arg(&diff_buf)
-            .arg(base_nonce)
-            .arg(batch_size)
-            .arg(&result_buf)
-            .arg(&found_buf)
-            .global_work_size(work_size)
-            .build()
-            .ok()?;
-
-        unsafe { kernel.enq().ok()?; }
-
-        total_hashes.fetch_add(hashes_per_launch, Ordering::Relaxed);
-
-        let mut found = vec![0i32; 1];
-        found_buf.read(&mut found).enq().ok()?;
-
-        if found[0] != 0 {
-            let mut result = vec![0u64; 1];
-            result_buf.read(&mut result).enq().ok()?;
-            stop_flag.store(true, Ordering::Relaxed);
-            let _ = hashrate_handle.await;
-            return Some(result[0]);
-        }
-
-        base_nonce = base_nonce.wrapping_add(hashes_per_launch);
-    }
+    rx
 }
+
+/// Multi-GPU mining: launch one mine_one_gpu per device, return first nonce found.
+async fn mine_gpu_multi(gpus: &[ProQue], work: &Work, engine: Arc<ClaimEngine>) -> Option<u64> {
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let mut handles = Vec::new();
+
+    for (i, gpu) in gpus.iter().enumerate() {
+        let rx = mine_one_gpu(i, gpu.clone(), work, stop_flag.clone(), engine.clone());
+        handles.push(rx);
+    }
+
+    // Wait for any GPU to return a nonce (first one wins)
+    let mut set = tokio::task::JoinSet::new();
+    for rx in handles {
+        set.spawn(async move { rx.await });
+    }
+
+    while let Some(res) = set.join_next().await {
+        match res {
+            Ok(Ok(Some(nonce))) => {
+                stop_flag.store(true, Ordering::SeqCst);
+                // Drain remaining receivers so their threads exit
+                while set.join_next().await.is_some() {}
+                return Some(nonce);
+            }
+            _ => continue,
+        }
+    }
+    None
+}
+
