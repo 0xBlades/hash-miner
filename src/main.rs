@@ -250,28 +250,22 @@ impl ClaimEngine {
         Some(estimated * U256::from(120) / U256::from(100)) // +20% buffer
     }
 
-    /// Fire mine(nonce) to ALL providers (MEV first, then regular) in parallel.
+    /// Fire mine(nonce) to ALL providers (MEV first, then regular).
+    /// Returns on first MEV success — don't wait for regular RPCs.
     async fn claim(&self, nonce: u64) -> (usize, usize) {
         let nonce_u256 = U256::from(nonce);
 
-        // Estimate dynamic gas limit (cached — fast after first call)
+        // Get gas limit (cached)
         let gas_limit = self.gas_limit_for(nonce).await;
 
-        // Build all futures: MEV/Flashbots FIRST, then regular
-        let mut all: Vec<(&str, &Contract<SignerMiddleware<Provider<Http>, LocalWallet>>)> = Vec::new();
+        // Fire MEV/Flashbots FIRST — these are the critical ones
+        let mut mev_futs = Vec::new();
         for (label, c) in &self.priority_contracts {
-            all.push((label, c));
-        }
-        for (label, c) in &self.contracts {
-            all.push((label, c));
-        }
-
-        let futs: Vec<_> = all.into_iter().map(|(label, c)| {
             let c = c.clone();
             let label = label.to_string();
             let gp = self.gas_price;
             let gl = gas_limit;
-            async move {
+            mev_futs.push(async move {
                 match c.method::<U256, ()>("mine", nonce_u256) {
                     Ok(call) => match call.gas_price(gp).gas(gl).send().await {
                         Ok(pending) => {
@@ -289,13 +283,52 @@ impl ClaimEngine {
                         Err(label)
                     }
                 }
-            }
-        }).collect();
+            });
+        }
 
-        let results = futures::future::join_all(futs).await;
-        let ok = results.iter().filter(|r| r.is_ok()).count();
-        let fail = results.len() - ok;
-        (ok, fail)
+        // Wait for FIRST MEV success — then return immediately
+        let mev_results = futures::future::join_all(mev_futs).await;
+        let mev_ok = mev_results.iter().filter(|r| r.is_ok()).count();
+        let mev_fail = mev_results.len() - mev_ok;
+
+        // Fire regular RPCs in background (don't wait)
+        let mut regular_futs = Vec::new();
+        for (label, c) in &self.contracts {
+            let c = c.clone();
+            let label = label.to_string();
+            let gp = self.gas_price;
+            let gl = gas_limit;
+            regular_futs.push(async move {
+                match c.method::<U256, ()>("mine", nonce_u256) {
+                    Ok(call) => match call.gas_price(gp).gas(gl).send().await {
+                        Ok(pending) => {
+                            let hash = pending.tx_hash();
+                            log_line(&format!("  ✅ [{}] sent | tx=0x{:x}", label, hash));
+                            Ok(label)
+                        }
+                        Err(e) => {
+                            log_line(&format!("  ⚠️ [{}] failed: {}", label, e));
+                            Err(label)
+                        }
+                    },
+                    Err(e) => {
+                        log_line(&format!("  ❌ [{}] build: {}", label, e));
+                        Err(label)
+                    }
+                }
+            });
+        }
+        // Spawn regular RPCs in background — don't block claim
+        tokio::spawn(async move {
+            let results = futures::future::join_all(regular_futs).await;
+            let ok = results.iter().filter(|r| r.is_ok()).count();
+            let fail = results.len() - ok;
+            if fail > 0 {
+                log_line(&format!("  📡 Regular RPCs: {}/{} OK", ok, ok + fail));
+            }
+        });
+
+        (mev_ok, mev_fail)
     }
 }
 
